@@ -367,7 +367,10 @@ async function generate() {
     $('audio').src = lastURL; $('dl').href = lastURL; $('dl').download = `hinglish_${voice}.wav`;
     const secs = (r.tTotal / 1000), rt = (r.durSec / secs);
     const chunkInfo = r.nChunks > 1 ? ` · ${r.nChunks} chunks` : '';
-    $('rinfo').textContent = `${r.durSec.toFixed(1)}s audio in ${secs.toFixed(1)}s · ${rt.toFixed(2)}x realtime · ${voice}${chunkInfo}`;
+    const phaseInfo = r.tPrefill != null
+      ? ` · prefill ${(r.tPrefill/1000).toFixed(2)}s dec ${(r.tDecode/1000).toFixed(2)}s voc ${(r.tVocoder/1000).toFixed(2)}s`
+      : '';
+    $('rinfo').textContent = `${r.durSec.toFixed(1)}s audio in ${secs.toFixed(1)}s · ${rt.toFixed(2)}x realtime · ${voice}${chunkInfo}${phaseInfo}`;
     $('result').classList.add('on');
     lastResult = r;                                  // for the transcribe-&-verify round-trip
     // verify panel is a dev tool: only shown when a transcription proxy is configured (off in prod)
