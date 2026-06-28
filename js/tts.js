@@ -7,6 +7,7 @@
 
 import { loadTokenizer } from './tokenizer.js';
 import { loadNormalizer } from './normalize.js';
+import { chunkText, concatWavs, DEFAULT_MAX_TEXT_IDS } from './chunk.js';
 
 const ORT_VER = '1.22.0';
 const ORT_CDN = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/`;
@@ -36,6 +37,8 @@ export class HinglishTTS {
     this.ST = this.C.start_text_token;
     this.ET = this.C.stop_text_token;
     this.MAXG = this.C.max_gen_mel_tokens;
+    this.chunkCfg = cfg.chunk || {};
+    this.maxTextIds = this.chunkCfg.maxTextIds || DEFAULT_MAX_TEXT_IDS;
     this.provider = null;
   }
 
@@ -151,13 +154,12 @@ export class HinglishTTS {
   _argmax(a) { let bi = 0, bv = a[0]; for (let k = 1; k < a.length; k++) if (a[k] > bv) { bv = a[k]; bi = k; } return bi; }
   normalizeText(text) { return this.norm ? this.norm.normalize(text) : { out: text, spans: [] }; }
 
-  async generate(text, voice, { onToken, autoNormalize = true } = {}) {
+  // Synthesize ONE chunk of already-normalized text. Bit-identical to the
+  // original single-pass generate() loop. Returns { wav, codes, latents... }.
+  async _genChunk(normText, v, { onToken, tokenBase = 0 } = {}) {
     const o = ort;
-    const v = this.voices[voice] || this.voices[this.cfg.voices[0]];
-    const normText = autoNormalize ? this.normalizeText(text).out : text;
     const ids = this.tok.encode(normText, 'hi');
     const seqSet = new Set([1, this.SA]);
-    const t0 = performance.now();
 
     const { data: pe, L } = this._prefillEmbeds(ids, v.cond);
     let out = await this.sStep.run({ inputs_embeds: new o.Tensor('float32', pe, [1, L, 640]), ...this._emptyPast(o) });
@@ -170,7 +172,7 @@ export class HinglishTTS {
       const nxt = this._argmax(logits);
       if (nxt === this.EA) { codes.push(nxt); break; }
       codes.push(nxt); seqSet.add(nxt);
-      if (onToken && (step % 8 === 0)) onToken(codes.length);
+      if (onToken && (step % 8 === 0)) onToken(tokenBase + codes.length);
       const feed = { inputs_embeds: new o.Tensor('float32', this._decodeEmbed(nxt, codes.length), [1, 1, 640]) };
       for (let j = 0; j < this.NL; j++) { feed[`past_key_values.${j}.key`] = past[`present.${j}.key`]; feed[`past_key_values.${j}.value`] = past[`present.${j}.value`]; }
       out = await this.sStep.run(feed);
@@ -178,16 +180,42 @@ export class HinglishTTS {
       lats.push(Float32Array.from(out.latent.data));
       past = out;
     }
-    const tGen = performance.now() - t0;
-
     const N = lats.length, lat = new Float32Array(N * D);
     for (let k = 0; k < N; k++) lat.set(lats[k], k * D);
     const g = new o.Tensor('float32', v.spk, [1, ...v.spkShape]);
     const vout = await this.sVoc.run({ lat640: new o.Tensor('float32', lat, [1, N, 640]), g });
-    const wav = Float32Array.from(vout.wav.data);
+    return { wav: Float32Array.from(vout.wav.data), codes };
+  }
+
+  async generate(text, voice, { onToken, autoNormalize = true } = {}) {
+    const v = this.voices[voice] || this.voices[this.cfg.voices[0]];
+    const normText = autoNormalize ? this.normalizeText(text).out : text;
+    const t0 = performance.now();
+
+    // Length-independent path: split long input into sentence-aligned chunks,
+    // synthesize each at full fidelity, concatenate. Single chunk => unchanged.
+    const chunks = chunkText(normText, (t) => this.tok.encode(t, 'hi').length, this.maxTextIds);
+    if (chunks.length > 1) {
+      const wavs = []; const allCodes = []; let tokenBase = 0;
+      for (const ch of chunks) {
+        const r = await this._genChunk(ch, v, { onToken, tokenBase });
+        wavs.push(r.wav); allCodes.push(...r.codes); tokenBase += r.codes.length;
+      }
+      const cc = this.chunkCfg;
+      const wav = concatWavs(wavs, this.C.sample_rate, {
+        gapMs: cc.gapMs ?? 90, crossfadeMs: cc.crossfadeMs ?? 4,
+        ampThresh: cc.ampThresh ?? 0.01, padMs: cc.padMs ?? 30,
+      });
+      const tTotal = performance.now() - t0;
+      return { wav, sampleRate: this.C.sample_rate, codes: allCodes, nCodes: allCodes.length,
+               tGen: tTotal, tTotal, nChunks: chunks.length, chunks,
+               durSec: wav.length / this.C.sample_rate, provider: this.provider, normText, inputText: text };
+    }
+
+    const { wav, codes } = await this._genChunk(normText, v, { onToken });
     const tTotal = performance.now() - t0;
-    return { wav, sampleRate: this.C.sample_rate, codes, nCodes: codes.length, tGen, tTotal,
-             durSec: wav.length / this.C.sample_rate, provider: this.provider, normText, inputText: text };
+    return { wav, sampleRate: this.C.sample_rate, codes, nCodes: codes.length, tGen: tTotal, tTotal,
+             nChunks: 1, durSec: wav.length / this.C.sample_rate, provider: this.provider, normText, inputText: text };
   }
 }
 

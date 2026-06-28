@@ -18,6 +18,13 @@
   "decode": {
     "repetition_penalty": 1.3
   },
+  "chunk": {
+    "maxTextIds": 60,
+    "gapMs": 90,
+    "crossfadeMs": 4,
+    "ampThresh": 0.01,
+    "padMs": 30
+  },
   "voices": [
     "aadya",
     "arjun",
