@@ -20,8 +20,11 @@ async function loadORT() {
   if (ort) return ort;
   ort = await import(`${ORT_CDN}ort.webgpu.min.mjs`);
   ort.env.wasm.wasmPaths = ORT_CDN;
-  // Use 4 threads when crossOriginIsolated (COOP+COEP headers set); fall back to 1 otherwise.
-  ort.env.wasm.numThreads = (typeof self !== 'undefined' && self.crossOriginIsolated) ? 4 : 1;
+  // Use up to 4 threads when crossOriginIsolated (COOP+COEP headers set), but never
+  // more than the machine has cores (oversubscription hurts on 2-core phones);
+  // fall back to 1 otherwise. 4 was the measured sweet spot for the vocoder convs.
+  const hc = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
+  ort.env.wasm.numThreads = (typeof self !== 'undefined' && self.crossOriginIsolated) ? Math.max(1, Math.min(4, hc)) : 1;
   return ort;
 }
 
@@ -52,7 +55,20 @@ export class HinglishTTS {
       this._presKeys.push(`present.${j}.key`);
       this._presVals.push(`present.${j}.value`);
     }
+    // O11: serialization queue for ALL InferenceSession.run() calls. The ORT-web
+    // WebGPU build enforces a single in-flight run GLOBALLY (across sessions, not
+    // per session — it suspends inside the shared WASM module), and background
+    // voice pre-warm may now overlap a user generate().
+    this._q = Promise.resolve();
   }
+
+  _enqueue(fn) {
+    const p = this._q.then(fn);
+    this._q = p.then(() => {}, () => {});
+    return p;
+  }
+  _runStep(feed) { return this._enqueue(() => this.sStep.run(feed)); }
+  _runVoc(feed)  { return this._enqueue(() => this.sVoc.run(feed)); }
 
   async _fetchBuf(url, key, label, onFile) {
     const cache = await caches.open(CACHE).catch(() => null);
@@ -84,12 +100,27 @@ export class HinglishTTS {
     // O4: request high-performance GPU when available
     if (wantGPU && o.env.webgpu) o.env.webgpu.powerPreference = 'high-performance';
 
+    const M = this.cfg.models;
+    const url = (p) => this.cfg.modelBase ? new URL(p, this.cfg.modelBase).href : p;
+
+    // O8: fp16 HEAD probe starts immediately and overlaps the asset loads below
+    // (was: a blocking round-trip between asset load and model download).
+    const fp16Probe = (wantGPU && M.step_fp16)
+      ? fetch(url(M.step_fp16), { method: 'HEAD' }).then((r) => r.ok).catch(() => false)
+      : Promise.resolve(false);
+
     prog('loading runtime + tokenizer');
-    const { PreTrainedTokenizer } = await import(/* @vite-ignore */ HF_CDN);
-    this.tok  = await loadTokenizer(new URL('assets/tokenizer.json', location.href).href, { PreTrainedTokenizer });
-    this.norm = await loadNormalizer(new URL('assets/normalize.json', location.href).href);
-    await this._loadVoices();
-    await this._loadEmbeddings();
+    // O9: tokenizer, normalizer, voices and embeddings are independent of the models
+    // and of each other — load them all concurrently with the model download.
+    const assetsP = Promise.all([
+      import(/* @vite-ignore */ HF_CDN)
+        .then(({ PreTrainedTokenizer }) =>
+          loadTokenizer(new URL('assets/tokenizer.json', location.href).href, { PreTrainedTokenizer }))
+        .then((t) => { this.tok = t; }),
+      loadNormalizer(new URL('assets/normalize.json', location.href).href).then((n) => { this.norm = n; }),
+      this._loadVoices(),
+      this._loadEmbeddings(),
+    ]);
 
     // O5 (WebGPU path): keep KV-cache output tensors on the GPU across decode steps.
     // This eliminates 2 × NL GPU→CPU→GPU transfers per decode step. On the WASM path
@@ -110,45 +141,48 @@ export class HinglishTTS {
     };
     const vocOpt = { executionProviders: eps, graphOptimizationLevel: 'all' };
 
-    const M = this.cfg.models;
-    const url = (p) => this.cfg.modelBase ? new URL(p, this.cfg.modelBase).href : p;
-
     // On WebGPU, prefer fp16 models (~2x faster: WebGPU EP supports fp16 natively,
     // unlike WASM EP which requires fp16 inputs and has no auto-cast).
-    let useFp16 = false;
-    if (wantGPU && M.step_fp16) {
-      try {
-        const probe = await fetch(url(M.step_fp16), { method: 'HEAD' });
-        if (probe.ok) useFp16 = true;
-      } catch {}
-    }
+    const useFp16 = await fp16Probe;
     const stepPath  = useFp16 ? M.step_fp16  : M.step;
     const vocPath   = useFp16 ? M.vocoder_fp16 : M.vocoder;
     const stepLabel = useFp16 ? 'Acoustic model (fp16)' : 'Acoustic model';
     const vocLabel  = useFp16 ? 'Vocoder (fp16)'        : 'Vocoder';
 
     prog('downloading model');
-    const stepBuf = await this._fetchBuf(url(stepPath), 'step', stepLabel, file);
-    this.sStep = await o.InferenceSession.create(new Uint8Array(stepBuf), stepOpt);
-    const vocBuf = await this._fetchBuf(url(vocPath), 'vocoder', vocLabel, file);
-    this.sVoc = await o.InferenceSession.create(new Uint8Array(vocBuf), vocOpt);
+    // O10: download and build both sessions concurrently — the vocoder download and
+    // compile now fully overlap the (4.4× larger) acoustic model's, instead of
+    // starting only after it finished.
+    const [sStep, sVoc] = await Promise.all([
+      this._fetchBuf(url(stepPath), 'step', stepLabel, file)
+        .then((buf) => o.InferenceSession.create(new Uint8Array(buf), stepOpt)),
+      this._fetchBuf(url(vocPath), 'vocoder', vocLabel, file)
+        .then((buf) => o.InferenceSession.create(new Uint8Array(buf), vocOpt)),
+    ]);
+    this.sStep = sStep;
+    this.sVoc  = sVoc;
     this.provider = wantGPU ? (useFp16 ? 'webgpu-fp16' : 'webgpu') : 'wasm';
+    await assetsP;
 
     // Pre-warm voice conditioning KV: run sStep once per voice on its 32 cond tokens.
     // Each gen() call then only processes the shorter text+SA sequence as the prefill.
     // Math: identical to full-prefill by KV-cache / causal-mask property (proven by parity gate).
+    // O11: on WebGPU only the first voice blocks readiness; the rest pre-warm in the
+    // background on the serialized step queue (generate() awaits v.ready, so a voice
+    // can never run before its KV exists). On WASM the runs execute on the main
+    // thread, so finish them all before 'ready' to avoid post-ready jank.
     prog('precomputing voice embeddings');
-    for (const [, v] of Object.entries(this.voices)) {
-      const condOut = await this.sStep.run({
-        inputs_embeds: new o.Tensor('float32', v.cond, [1, v.condShape[0], D]),
-        ...this._emptyPast(o),
-      });
-      v.condKv = {};
-      for (let j = 0; j < this.NL; j++) {
-        v.condKv[this._pastKeys[j]] = condOut[this._presKeys[j]];
-        v.condKv[this._pastVals[j]] = condOut[this._presVals[j]];
-      }
+    const names = [...new Set([...(this.cfg.voices || []), ...Object.keys(this.voices)])];
+    let chain = Promise.resolve();
+    for (const name of names) {
+      const v = this.voices[name];
+      if (!v) continue;
+      chain = chain.then(() => this._prewarmVoice(o, v));
+      v.ready = chain;
+      v.ready.catch(() => {}); // background failure surfaces on generate(), not as unhandled
     }
+    await this.voices[this.cfg.voices[0]].ready;
+    if (!wantGPU) await chain;
 
     prog('warming up');
     await this._warmup().catch(() => {});
@@ -197,6 +231,21 @@ export class HinglishTTS {
     return this._decBuf;
   }
 
+  // Run one voice's 32 cond tokens through sStep; keep the resulting KV tensors
+  // (GPU-resident under the WebGPU EP) as this voice's prefill prefix.
+  async _prewarmVoice(o, v) {
+    const condOut = await this._runStep({
+      inputs_embeds: new o.Tensor('float32', v.cond, [1, v.condShape[0], D]),
+      ...this._emptyPast(o),
+    });
+    const kv = {};
+    for (let j = 0; j < this.NL; j++) {
+      kv[this._pastKeys[j]] = condOut[this._presKeys[j]];
+      kv[this._pastVals[j]] = condOut[this._presVals[j]];
+    }
+    v.condKv = kv;
+  }
+
   _emptyPast(o) {
     const f = {};
     for (let j = 0; j < this.NL; j++) {
@@ -209,12 +258,12 @@ export class HinglishTTS {
   async _warmup() {
     const o = ort, v = this.voices[this.cfg.voices[0]];
     const { data, L } = this._prefillEmbeds([10, 11]);
-    const out = await this.sStep.run({ inputs_embeds: new o.Tensor('float32', data, [1, L, 640]), ...v.condKv });
+    const out = await this._runStep({ inputs_embeds: new o.Tensor('float32', data, [1, L, 640]), ...v.condKv });
     const feed = { inputs_embeds: new o.Tensor('float32', this._decodeEmbed(5, 1), [1, 1, 640]) };
     for (let j = 0; j < this.NL; j++) { feed[this._pastKeys[j]] = out[this._presKeys[j]]; feed[this._pastVals[j]] = out[this._presVals[j]]; }
-    await this.sStep.run(feed);
+    await this._runStep(feed);
     const g = new o.Tensor('float32', v.spk, [1, ...v.spkShape]);
-    await this.sVoc.run({ lat640: new o.Tensor('float32', new Float32Array(640), [1, 1, 640]), g });
+    await this._runVoc({ lat640: new o.Tensor('float32', new Float32Array(640), [1, 1, 640]), g });
   }
 
   _repPenalty(logits, seqSet) { const p = this.PEN; for (const t of seqSet) { const s = logits[t]; logits[t] = s < 0 ? s * p : s / p; } }
@@ -230,7 +279,7 @@ export class HinglishTTS {
 
     const { data: pe, L } = this._prefillEmbeds(ids);
     const tPrefillStart = performance.now();
-    let out = await this.sStep.run({ inputs_embeds: new o.Tensor('float32', pe, [1, L, 640]), ...v.condKv });
+    let out = await this._runStep({ inputs_embeds: new o.Tensor('float32', pe, [1, L, 640]), ...v.condKv });
     const tPrefill = performance.now() - tPrefillStart;
 
     // O1: pre-allocated stacked latent buffer — write each step directly, no lats[] array,
@@ -247,6 +296,13 @@ export class HinglishTTS {
     const codes = [];
     const tDecodeStart = performance.now();
 
+    // O12: one stable feed object reused every step (same hidden class, no per-step
+    // object allocation or 33 shape transitions), with hoisted key-array lookups.
+    const PK = this._pastKeys, PV = this._pastVals, RK = this._presKeys, RV = this._presVals;
+    const NL = this.NL;
+    const feed = { inputs_embeds: null };
+    for (let j = 0; j < NL; j++) { feed[PK[j]] = null; feed[PV[j]] = null; }
+
     for (let step = 0; step < this.MAXG; step++) {
       this._repPenalty(logits, seqSet);
       const nxt = this._argmax(logits);
@@ -255,20 +311,20 @@ export class HinglishTTS {
       if (onToken && (step % 8 === 0)) onToken(tokenBase + codes.length);
 
       // O3: _decodeEmbed reuses this._decBuf — ORT copies on Tensor creation
-      const feed = { inputs_embeds: new o.Tensor('float32', this._decodeEmbed(nxt, codes.length), [1, 1, 640]) };
+      feed.inputs_embeds = new o.Tensor('float32', this._decodeEmbed(nxt, codes.length), [1, 1, 640]);
       // O7: use pre-cached key arrays instead of template-literal concat per step
-      for (let j = 0; j < this.NL; j++) {
-        feed[this._pastKeys[j]] = past[this._presKeys[j]];
-        feed[this._pastVals[j]] = past[this._presVals[j]];
+      for (let j = 0; j < NL; j++) {
+        feed[PK[j]] = past[RK[j]];
+        feed[PV[j]] = past[RV[j]];
       }
-      out = await this.sStep.run(feed);
+      out = await this._runStep(feed);
 
       // O6: dispose previous step's KV tensors immediately after run() consumes them.
       // Without this, WASM heap / GPU VRAM accumulates ~170 MB of KV garbage across all
       // decode steps, which triggers a massive GC pause (we measured a 32s outlier).
-      for (let j = 0; j < this.NL; j++) {
-        past[this._presKeys[j]]?.dispose?.();
-        past[this._presVals[j]]?.dispose?.();
+      for (let j = 0; j < NL; j++) {
+        past[RK[j]]?.dispose?.();
+        past[RV[j]]?.dispose?.();
       }
 
       // O1: direct write into pre-allocated buffer
@@ -289,11 +345,13 @@ export class HinglishTTS {
     // O1: subarray avoids a separate N*D allocation; vocoder reads the live view
     const g = new o.Tensor('float32', v.spk, [1, ...v.spkShape]);
     const tVocStart = performance.now();
-    const vout = await this.sVoc.run({ lat640: new o.Tensor('float32', lat.subarray(0, N * D), [1, N, 640]), g });
+    const vout = await this._runVoc({ lat640: new o.Tensor('float32', lat.subarray(0, N * D), [1, N, 640]), g });
     const tVocoder = performance.now() - tVocStart;
 
     return {
-      wav: Float32Array.from(vout.wav.data),
+      // O13: use the output tensor's buffer directly — ORT-web hands back a
+      // JS-owned copy already, so Float32Array.from() was a second full copy.
+      wav: vout.wav.data,
       codes,
       tPrefill,
       tDecode,
@@ -304,6 +362,8 @@ export class HinglishTTS {
 
   async generate(text, voice, { onToken, autoNormalize = true } = {}) {
     const v = this.voices[voice] || this.voices[this.cfg.voices[0]];
+    // O11: voices may still be pre-warming in the background right after init()
+    if (!v.condKv && v.ready) await v.ready;
     const normText = autoNormalize ? this.normalizeText(text).out : text;
     const t0 = performance.now();
 
